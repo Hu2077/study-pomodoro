@@ -25,6 +25,14 @@ const nextPhaseLabels: Record<Phase, string> = {
   break: "学习",
 };
 
+function getPhaseDurationSeconds(
+  phase: Phase,
+  studyMinutes: number,
+  breakMinutes: number,
+) {
+  return (phase === "study" ? studyMinutes : breakMinutes) * 60;
+}
+
 function clampMinutes(value: number) {
   if (!Number.isFinite(value)) {
     return MIN_MINUTES;
@@ -96,10 +104,15 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [audioReady, setAudioReady] = useState(false);
   const audioContextRef = useRef<AudioContext | null>(null);
-  const nextPhaseHandledRef = useRef(false);
+  const phaseEndsAtRef = useRef<number | null>(null);
+  const phaseRef = useRef<Phase>("study");
+  const statusRef = useRef<TimerStatus>("idle");
 
-  const selectedPhaseDurationSeconds =
-    (phase === "study" ? studyMinutes : breakMinutes) * 60;
+  const selectedPhaseDurationSeconds = getPhaseDurationSeconds(
+    phase,
+    studyMinutes,
+    breakMinutes,
+  );
   const progress =
     currentPhaseDurationSeconds === 0
       ? 0
@@ -123,7 +136,16 @@ function App() {
   }, [breakMinutes, soundEnabled, studyMinutes]);
 
   useEffect(() => {
+    phaseRef.current = phase;
+  }, [phase]);
+
+  useEffect(() => {
+    statusRef.current = status;
+  }, [status]);
+
+  useEffect(() => {
     if (status === "idle") {
+      phaseEndsAtRef.current = null;
       setCurrentPhaseDurationSeconds(selectedPhaseDurationSeconds);
       setRemainingSeconds(selectedPhaseDurationSeconds);
     }
@@ -134,26 +156,25 @@ function App() {
       return;
     }
 
-    const intervalId = window.setInterval(() => {
-      setRemainingSeconds((current) => Math.max(0, current - 1));
-    }, 1000);
+    syncTimerToClock();
 
-    return () => window.clearInterval(intervalId);
-  }, [isRunning]);
+    const intervalId = window.setInterval(syncTimerToClock, 1000);
+    const handleVisibilityChange = () => {
+      if (document.visibilityState === "visible") {
+        syncTimerToClock();
+      }
+    };
+    const handleFocus = () => syncTimerToClock();
 
-  useEffect(() => {
-    if (status !== "running" || remainingSeconds > 0) {
-      nextPhaseHandledRef.current = false;
-      return;
-    }
+    document.addEventListener("visibilitychange", handleVisibilityChange);
+    window.addEventListener("focus", handleFocus);
 
-    if (nextPhaseHandledRef.current) {
-      return;
-    }
-
-    nextPhaseHandledRef.current = true;
-    finishCurrentPhase();
-  }, [remainingSeconds, status]);
+    return () => {
+      window.clearInterval(intervalId);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
+      window.removeEventListener("focus", handleFocus);
+    };
+  }, [breakMinutes, isRunning, soundEnabled, studyMinutes]);
 
   async function prepareAudio() {
     if (!audioContextRef.current) {
@@ -226,41 +247,100 @@ function App() {
     });
   }
 
-  function finishCurrentPhase() {
-    const finishedPhase = phase;
-    const nextPhase: Phase = finishedPhase === "study" ? "break" : "study";
-    const nextDurationSeconds = (nextPhase === "study" ? studyMinutes : breakMinutes) * 60;
-
-    void playReminderSound();
-    notifyPhaseEnd(finishedPhase);
-
-    if (finishedPhase === "study") {
-      setCompletedRounds((rounds) => rounds + 1);
+  function syncTimerToClock(now = Date.now()) {
+    if (statusRef.current !== "running" || phaseEndsAtRef.current === null) {
+      return;
     }
 
+    if (now < phaseEndsAtRef.current) {
+      setRemainingSeconds(
+        Math.max(0, Math.ceil((phaseEndsAtRef.current - now) / 1000)),
+      );
+      return;
+    }
+
+    let nextPhase = phaseRef.current;
+    let nextPhaseEndsAt = phaseEndsAtRef.current;
+    let completedStudyRounds = 0;
+    let lastFinishedPhase: Phase | null = null;
+    let transitions = 0;
+
+    while (now >= nextPhaseEndsAt && transitions < 20000) {
+      lastFinishedPhase = nextPhase;
+
+      if (nextPhase === "study") {
+        completedStudyRounds += 1;
+      }
+
+      nextPhase = nextPhase === "study" ? "break" : "study";
+      nextPhaseEndsAt += getPhaseDurationSeconds(
+        nextPhase,
+        studyMinutes,
+        breakMinutes,
+      ) * 1000;
+      transitions += 1;
+    }
+
+    const nextDurationSeconds = getPhaseDurationSeconds(
+      nextPhase,
+      studyMinutes,
+      breakMinutes,
+    );
+    const nextRemainingSeconds =
+      now >= nextPhaseEndsAt
+        ? nextDurationSeconds
+        : Math.max(0, Math.ceil((nextPhaseEndsAt - now) / 1000));
+
+    phaseRef.current = nextPhase;
+    phaseEndsAtRef.current = nextPhaseEndsAt;
     setPhase(nextPhase);
     setCurrentPhaseDurationSeconds(nextDurationSeconds);
-    setRemainingSeconds(nextDurationSeconds);
-    setStatus("running");
+    setRemainingSeconds(nextRemainingSeconds);
+
+    if (completedStudyRounds > 0) {
+      setCompletedRounds((rounds) => rounds + completedStudyRounds);
+    }
+
+    if (lastFinishedPhase) {
+      void playReminderSound();
+      notifyPhaseEnd(lastFinishedPhase);
+    }
   }
 
   async function handleStart() {
     await prepareAudio().catch(() => setAudioReady(false));
+    phaseEndsAtRef.current = Date.now() + remainingSeconds * 1000;
+    statusRef.current = "running";
     setStatus("running");
   }
 
   async function handleResume() {
     await prepareAudio().catch(() => setAudioReady(false));
+    phaseEndsAtRef.current = Date.now() + remainingSeconds * 1000;
+    statusRef.current = "running";
     setStatus("running");
   }
 
   function handlePause() {
+    syncTimerToClock();
+
+    if (phaseEndsAtRef.current !== null) {
+      setRemainingSeconds(
+        Math.max(0, Math.ceil((phaseEndsAtRef.current - Date.now()) / 1000)),
+      );
+    }
+
+    phaseEndsAtRef.current = null;
+    statusRef.current = "paused";
     setStatus("paused");
   }
 
   function handleReset() {
     const studyDurationSeconds = studyMinutes * 60;
 
+    phaseEndsAtRef.current = null;
+    phaseRef.current = "study";
+    statusRef.current = "idle";
     setStatus("idle");
     setPhase("study");
     setCurrentPhaseDurationSeconds(studyDurationSeconds);
@@ -270,12 +350,19 @@ function App() {
 
   function handleSkip() {
     const nextPhase: Phase = phase === "study" ? "break" : "study";
-    const nextDurationSeconds = (nextPhase === "study" ? studyMinutes : breakMinutes) * 60;
+    const nextDurationSeconds = getPhaseDurationSeconds(
+      nextPhase,
+      studyMinutes,
+      breakMinutes,
+    );
 
     if (phase === "study") {
       setCompletedRounds((rounds) => rounds + 1);
     }
 
+    phaseRef.current = nextPhase;
+    phaseEndsAtRef.current =
+      status === "running" ? Date.now() + nextDurationSeconds * 1000 : null;
     setPhase(nextPhase);
     setCurrentPhaseDurationSeconds(nextDurationSeconds);
     setRemainingSeconds(nextDurationSeconds);
