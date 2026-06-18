@@ -14,6 +14,27 @@ const DEFAULT_BREAK_MINUTES = 10;
 const SETTINGS_KEY = "study-pomodoro-settings";
 const MIN_MINUTES = 1;
 const MAX_MINUTES = 240;
+const CANON_BEAT_SECONDS = 0.28;
+const CANON_REMINDER_MOTIF = [
+  587.33, // D5
+  440.0, // A4
+  493.88, // B4
+  369.99, // F#4
+  392.0, // G4
+  293.66, // D4
+  392.0, // G4
+  440.0, // A4
+] as const;
+const CANON_REMINDER_BASS = [
+  146.83, // D3
+  110.0, // A2
+  123.47, // B2
+  92.5, // F#2
+  98.0, // G2
+  146.83, // D3
+  98.0, // G2
+  110.0, // A2
+] as const;
 
 const phaseLabels: Record<Phase, string> = {
   study: "学习中",
@@ -206,25 +227,71 @@ function App() {
         return;
       }
 
-      const now = context.currentTime;
-      const notes = [660, 880, 660];
+      const now = context.currentTime + 0.04;
+      const masterGain = context.createGain();
+      masterGain.gain.setValueAtTime(0.72, now);
+      masterGain.connect(context.destination);
 
-      notes.forEach((frequency, index) => {
+      const scheduleTone = (
+        frequency: number,
+        start: number,
+        duration: number,
+        volume: number,
+        type: OscillatorType,
+      ) => {
         const oscillator = context.createOscillator();
         const gain = context.createGain();
-        const start = now + index * 0.22;
-        const end = start + 0.16;
+        const end = start + duration;
+        const sustainStart = Math.min(start + 0.03, end - 0.02);
+        const releaseStart = Math.max(sustainStart, end - 0.06);
 
-        oscillator.type = "sine";
+        oscillator.type = type;
         oscillator.frequency.setValueAtTime(frequency, start);
         gain.gain.setValueAtTime(0.0001, start);
-        gain.gain.exponentialRampToValueAtTime(0.28, start + 0.02);
+        gain.gain.exponentialRampToValueAtTime(volume, sustainStart);
+        gain.gain.setValueAtTime(volume, releaseStart);
         gain.gain.exponentialRampToValueAtTime(0.0001, end);
         oscillator.connect(gain);
-        gain.connect(context.destination);
+        gain.connect(masterGain);
         oscillator.start(start);
-        oscillator.stop(end + 0.02);
+        oscillator.stop(end + 0.04);
+      };
+
+      CANON_REMINDER_MOTIF.forEach((frequency, index) => {
+        const start = now + index * CANON_BEAT_SECONDS;
+        scheduleTone(
+          frequency,
+          start,
+          CANON_BEAT_SECONDS * 0.88,
+          0.16,
+          "triangle",
+        );
+
+        if (index < CANON_REMINDER_MOTIF.length - 2) {
+          scheduleTone(
+            frequency * 0.5,
+            start + CANON_BEAT_SECONDS * 2,
+            CANON_BEAT_SECONDS * 0.82,
+            0.08,
+            "sine",
+          );
+        }
       });
+
+      CANON_REMINDER_BASS.forEach((frequency, index) => {
+        scheduleTone(
+          frequency,
+          now + index * CANON_BEAT_SECONDS,
+          CANON_BEAT_SECONDS * 1.55,
+          0.055,
+          "sine",
+        );
+      });
+
+      window.setTimeout(
+        () => masterGain.disconnect(),
+        (CANON_REMINDER_MOTIF.length + 3) * CANON_BEAT_SECONDS * 1000,
+      );
     } catch {
       setAudioReady(false);
     }
