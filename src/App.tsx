@@ -14,6 +14,7 @@ const DEFAULT_BREAK_MINUTES = 10;
 const SETTINGS_KEY = "study-pomodoro-settings";
 const MIN_MINUTES = 1;
 const MAX_MINUTES = 240;
+const RECORDED_REMINDER_AUDIO_URL = `${import.meta.env.BASE_URL}audio/canon-reminder.mp3`;
 const CANON_BEAT_SECONDS = 0.28;
 const CANON_REMINDER_MOTIF = [
   587.33, // D5
@@ -125,6 +126,8 @@ function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [audioReady, setAudioReady] = useState(false);
   const audioContextRef = useRef<AudioContext | null>(null);
+  const recordedReminderBufferRef = useRef<AudioBuffer | null>(null);
+  const recordedReminderLoadPromiseRef = useRef<Promise<AudioBuffer> | null>(null);
   const phaseEndsAtRef = useRef<number | null>(null);
   const phaseRef = useRef<Phase>("study");
   const statusRef = useRef<TimerStatus>("idle");
@@ -197,22 +200,141 @@ function App() {
     };
   }, [breakMinutes, isRunning, soundEnabled, studyMinutes]);
 
-  async function prepareAudio() {
+  function getAudioContext() {
     if (!audioContextRef.current) {
       const AudioContextClass = window.AudioContext || window.webkitAudioContext;
+
       if (!AudioContextClass) {
-        setAudioReady(false);
-        return;
+        return null;
       }
 
       audioContextRef.current = new AudioContextClass();
     }
 
-    if (audioContextRef.current.state === "suspended") {
-      await audioContextRef.current.resume();
+    return audioContextRef.current;
+  }
+
+  async function loadRecordedReminderSound(context: AudioContext) {
+    if (recordedReminderBufferRef.current) {
+      return recordedReminderBufferRef.current;
     }
 
-    setAudioReady(true);
+    recordedReminderLoadPromiseRef.current ??= fetch(RECORDED_REMINDER_AUDIO_URL)
+      .then((response) => {
+        if (!response.ok) {
+          throw new Error("Reminder audio failed to load.");
+        }
+
+        return response.arrayBuffer();
+      })
+      .then((arrayBuffer) => context.decodeAudioData(arrayBuffer))
+      .then((buffer) => {
+        recordedReminderBufferRef.current = buffer;
+        return buffer;
+      });
+
+    return recordedReminderLoadPromiseRef.current;
+  }
+
+  async function prepareAudio() {
+    const context = getAudioContext();
+    if (!context) {
+      setAudioReady(false);
+      return;
+    }
+
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+
+    void loadRecordedReminderSound(context)
+      .then(() => setAudioReady(true))
+      .catch(() => setAudioReady(context.state === "running"));
+
+    setAudioReady(context.state === "running");
+  }
+
+  function playGeneratedCanonSound(context: AudioContext) {
+    const now = context.currentTime + 0.04;
+    const masterGain = context.createGain();
+    masterGain.gain.setValueAtTime(0.72, now);
+    masterGain.connect(context.destination);
+
+    const scheduleTone = (
+      frequency: number,
+      start: number,
+      duration: number,
+      volume: number,
+      type: OscillatorType,
+    ) => {
+      const oscillator = context.createOscillator();
+      const gain = context.createGain();
+      const end = start + duration;
+      const sustainStart = Math.min(start + 0.03, end - 0.02);
+      const releaseStart = Math.max(sustainStart, end - 0.06);
+
+      oscillator.type = type;
+      oscillator.frequency.setValueAtTime(frequency, start);
+      gain.gain.setValueAtTime(0.0001, start);
+      gain.gain.exponentialRampToValueAtTime(volume, sustainStart);
+      gain.gain.setValueAtTime(volume, releaseStart);
+      gain.gain.exponentialRampToValueAtTime(0.0001, end);
+      oscillator.connect(gain);
+      gain.connect(masterGain);
+      oscillator.start(start);
+      oscillator.stop(end + 0.04);
+    };
+
+    CANON_REMINDER_MOTIF.forEach((frequency, index) => {
+      const start = now + index * CANON_BEAT_SECONDS;
+      scheduleTone(
+        frequency,
+        start,
+        CANON_BEAT_SECONDS * 0.88,
+        0.16,
+        "triangle",
+      );
+
+      if (index < CANON_REMINDER_MOTIF.length - 2) {
+        scheduleTone(
+          frequency * 0.5,
+          start + CANON_BEAT_SECONDS * 2,
+          CANON_BEAT_SECONDS * 0.82,
+          0.08,
+          "sine",
+        );
+      }
+    });
+
+    CANON_REMINDER_BASS.forEach((frequency, index) => {
+      scheduleTone(
+        frequency,
+        now + index * CANON_BEAT_SECONDS,
+        CANON_BEAT_SECONDS * 1.55,
+        0.055,
+        "sine",
+      );
+    });
+
+    window.setTimeout(
+      () => masterGain.disconnect(),
+      (CANON_REMINDER_MOTIF.length + 3) * CANON_BEAT_SECONDS * 1000,
+    );
+  }
+
+  function playRecordedReminderSound(context: AudioContext, buffer: AudioBuffer) {
+    const source = context.createBufferSource();
+    const gain = context.createGain();
+
+    source.buffer = buffer;
+    gain.gain.setValueAtTime(0.9, context.currentTime);
+    source.connect(gain);
+    gain.connect(context.destination);
+    source.start();
+    source.onended = () => {
+      source.disconnect();
+      gain.disconnect();
+    };
   }
 
   async function playReminderSound() {
@@ -220,80 +342,24 @@ function App() {
       return;
     }
 
-    try {
-      await prepareAudio();
-      const context = audioContextRef.current;
-      if (!context) {
-        return;
-      }
-
-      const now = context.currentTime + 0.04;
-      const masterGain = context.createGain();
-      masterGain.gain.setValueAtTime(0.72, now);
-      masterGain.connect(context.destination);
-
-      const scheduleTone = (
-        frequency: number,
-        start: number,
-        duration: number,
-        volume: number,
-        type: OscillatorType,
-      ) => {
-        const oscillator = context.createOscillator();
-        const gain = context.createGain();
-        const end = start + duration;
-        const sustainStart = Math.min(start + 0.03, end - 0.02);
-        const releaseStart = Math.max(sustainStart, end - 0.06);
-
-        oscillator.type = type;
-        oscillator.frequency.setValueAtTime(frequency, start);
-        gain.gain.setValueAtTime(0.0001, start);
-        gain.gain.exponentialRampToValueAtTime(volume, sustainStart);
-        gain.gain.setValueAtTime(volume, releaseStart);
-        gain.gain.exponentialRampToValueAtTime(0.0001, end);
-        oscillator.connect(gain);
-        gain.connect(masterGain);
-        oscillator.start(start);
-        oscillator.stop(end + 0.04);
-      };
-
-      CANON_REMINDER_MOTIF.forEach((frequency, index) => {
-        const start = now + index * CANON_BEAT_SECONDS;
-        scheduleTone(
-          frequency,
-          start,
-          CANON_BEAT_SECONDS * 0.88,
-          0.16,
-          "triangle",
-        );
-
-        if (index < CANON_REMINDER_MOTIF.length - 2) {
-          scheduleTone(
-            frequency * 0.5,
-            start + CANON_BEAT_SECONDS * 2,
-            CANON_BEAT_SECONDS * 0.82,
-            0.08,
-            "sine",
-          );
-        }
-      });
-
-      CANON_REMINDER_BASS.forEach((frequency, index) => {
-        scheduleTone(
-          frequency,
-          now + index * CANON_BEAT_SECONDS,
-          CANON_BEAT_SECONDS * 1.55,
-          0.055,
-          "sine",
-        );
-      });
-
-      window.setTimeout(
-        () => masterGain.disconnect(),
-        (CANON_REMINDER_MOTIF.length + 3) * CANON_BEAT_SECONDS * 1000,
-      );
-    } catch {
+    const context = getAudioContext();
+    if (!context) {
       setAudioReady(false);
+      return;
+    }
+
+    if (context.state === "suspended") {
+      await context.resume();
+    }
+
+    try {
+      const buffer = await loadRecordedReminderSound(context);
+      playRecordedReminderSound(context, buffer);
+      setAudioReady(true);
+      return;
+    } catch {
+      playGeneratedCanonSound(context);
+      setAudioReady(true);
     }
   }
 
